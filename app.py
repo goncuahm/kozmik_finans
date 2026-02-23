@@ -45,9 +45,7 @@ ANN_PATIENCE = 50
 DAYS_SHORT = 10
 DAYS_LONG  = 365
 
-# 🔴 CHANGE THIS PATH
 EPHE_PATH = "planet_degrees.csv"
-
 
 # ============================================================
 # USER INPUT
@@ -105,7 +103,6 @@ if USE_NATAL:
     natal_row = eph.loc[natal_ts]
     natal = {p: float(natal_row[p]) % 360 for p in avail_planets}
 
-
 # ============================================================
 # DOWNLOAD PRICE
 # ============================================================
@@ -118,7 +115,6 @@ with st.spinner("Downloading price data..."):
         auto_adjust=False
     )
     
-    # Flatten MultiIndex if exists
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
     
@@ -126,15 +122,10 @@ with st.spinner("Downloading price data..."):
         st.error("Close column not found in downloaded data.")
         st.stop()
     
-    # raw['Close'] = pd.to_numeric(raw['Close'], errors='coerce')
-    # price_df = raw[['Close']].dropna()
-
+    # ✅ ERROR FIX: restore price_df creation
+    raw['Close'] = pd.to_numeric(raw['Close'], errors='coerce')
+    price_df = raw[['Close']].dropna().copy()
     price_df['log_price'] = np.log(price_df['Close'])
-    
-    # Optional safety check
-    if 'log_price' not in price_df.columns:
-        st.error("log_price column was not created.")
-        st.stop()
     
     if price_df.empty:
         st.error("No price data available for selected ticker/date.")
@@ -145,7 +136,7 @@ y_all     = price_df['log_price'].values
 n_total   = len(dates_all)
 
 # ============================================================
-# HELPER FUNCTIONS (UNCHANGED LOGIC)
+# HELPER FUNCTIONS (UNCHANGED)
 # ============================================================
 
 def angular_diff(a,b):
@@ -315,9 +306,8 @@ st.pyplot(fig2)
 
 win_future=pd.date_range(dates_all[-1]+pd.Timedelta(days=1),
                          periods=7,freq='B')
-win_all=win_future
 
-feat_win=build_features(win_all)
+feat_win=build_features(win_future)
 
 rows=[]
 for col in feat_win.columns:
