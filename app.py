@@ -126,8 +126,15 @@ with st.spinner("Downloading price data..."):
         st.error("Close column not found in downloaded data.")
         st.stop()
     
-    raw['Close'] = pd.to_numeric(raw['Close'], errors='coerce')
-    price_df = raw[['Close']].dropna()
+    # raw['Close'] = pd.to_numeric(raw['Close'], errors='coerce')
+    # price_df = raw[['Close']].dropna()
+
+    price_df['log_price'] = np.log(price_df['Close'])
+    
+    # Optional safety check
+    if 'log_price' not in price_df.columns:
+        st.error("log_price column was not created.")
+        st.stop()
     
     if price_df.empty:
         st.error("No price data available for selected ticker/date.")
