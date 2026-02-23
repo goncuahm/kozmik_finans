@@ -111,13 +111,27 @@ if USE_NATAL:
 # ============================================================
 
 with st.spinner("Downloading price data..."):
-    raw = yf.download(ticker,
-                      start=str(data_start),
-                      progress=False)
-
-raw['Close'] = pd.to_numeric(raw['Close'], errors='coerce')
-price_df = raw[['Close']].dropna()
-price_df['log_price'] = np.log(price_df['Close'])
+    raw = yf.download(
+        ticker,
+        start=str(data_start),
+        progress=False,
+        auto_adjust=False
+    )
+    
+    # Flatten MultiIndex if exists
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    
+    if 'Close' not in raw.columns:
+        st.error("Close column not found in downloaded data.")
+        st.stop()
+    
+    raw['Close'] = pd.to_numeric(raw['Close'], errors='coerce')
+    price_df = raw[['Close']].dropna()
+    
+    if price_df.empty:
+        st.error("No price data available for selected ticker/date.")
+        st.stop()
 
 dates_all = price_df.index
 y_all     = price_df['log_price'].values
