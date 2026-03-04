@@ -93,19 +93,19 @@ with st.sidebar:
 
     st.markdown("### 📈 Asset")
     ticker = st.text_input(
-        "Ticker (yfinance)", value="GLD",
+        "Ticker (yfinance)", value="EREGL.IS",
         help="Any yfinance ticker: GLD, AAPL, XU100.IS, BTC-USD …")
 
     st.markdown("### 🌟 Natal Chart")
     natal_date_input = st.text_input(
         "Natal / birth date (YYYY-MM-DD)",
-        value="1933-01-30",
+        value="1986-01-13",
         help="Founding or listing date of the asset. Leave blank to skip natal aspects.")
 
     st.markdown("### 📅 Date Range")
     data_start = st.text_input(
         "Price data start (YYYY-MM-DD)",
-        value="2023-01-01",
+        value="2022-01-01",
         help="Start date for downloading OHLC price data.")
 
     chart_end_input = st.text_input(
@@ -116,11 +116,11 @@ with st.sidebar:
     st.markdown("### 🔭 Orb Settings")
     orb_apply = st.slider(
         "Applying orb (degrees)",
-        min_value=0.5, max_value=6.0, value=4.0, step=0.5,
+        min_value=0.5, max_value=6.0, value=4.0, step=0.25,
         help="How many degrees before exact to start counting an aspect.")
     orb_sep = st.slider(
         "Separating orb (degrees)",
-        min_value=0.0, max_value=3.0, value=1.0, step=0.5,
+        min_value=0.0, max_value=3.0, value=1.0, step=0.25,
         help="How many degrees after exact to keep counting an aspect. "
              "Set to 0 to disable separating aspects entirely.")
 
