@@ -280,8 +280,8 @@ else:
 # ============================================================
 #  DOWNLOAD PRICE DATA
 # ============================================================
-
-DATA_END = datetime.date.today().strftime("%Y-%m-%d")
+DATA_END = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+# DATA_END = datetime.date.today().strftime("%Y-%m-%d")
 
 with st.spinner(f"Downloading {ticker} price data …"):
     try:
