@@ -824,10 +824,11 @@ def build_daily_net_with_price(raw_win, period_filter):
     Aggregates raw aspect detail rows into a daily net score table,
     joins actual price change for past rows, and returns:
       - display DataFrame
-      - accuracy float (only meaningful for 'Past')
+      - accuracy float based on close-to-close direction (only meaningful for 'Past')
+      - candle_accuracy float based on open-to-close direction (only meaningful for 'Past')
     """
     if raw_win.empty:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, None
 
     grp = (raw_win.groupby(['date', 'period'])
            .agg(Aspects=('score', 'count'), Net_Score=('score', 'sum'))
@@ -836,53 +837,74 @@ def build_daily_net_with_price(raw_win, period_filter):
 
     grp = grp[grp['period'] == period_filter].copy()
     if grp.empty:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, None
 
     grp['Bias'] = grp['Net_Score'].apply(
         lambda x: '▲ Bullish' if x > 0 else '▼ Bearish')
     grp['date'] = pd.to_datetime(grp['date'])
 
     if period_filter == 'Past':
-        # Build a daily close series indexed by date (date only, no time)
-        close_series = price_df['Close'].copy()
-        close_series.index = pd.to_datetime(close_series.index).normalize()
-        # Price change vs previous trading day close
-        price_chg = close_series.pct_change() * 100   # % change
-        price_dir = close_series.diff()                # raw direction
+        # Build daily series indexed by normalized date
+        px = price_df[['Open', 'Close']].copy()
+        px.index = pd.to_datetime(px.index).normalize()
+
+        close_series = px['Close']
+        open_series  = px['Open']
+
+        # Close-to-close change
+        price_chg = close_series.pct_change() * 100
+        price_dir = close_series.diff()
+
+        # Open-to-close direction (candle direction)
+        candle_dir = close_series - open_series
 
         grp = grp.merge(
-            pd.DataFrame({'date': close_series.index,
+            pd.DataFrame({'date': px.index,
                           'Price Chg %': price_chg.values,
-                          '_price_dir': price_dir.values}),
+                          '_price_dir': price_dir.values,
+                          '_candle_dir': candle_dir.values}),
             on='date', how='left')
 
         grp['Price Chg %'] = grp['Price Chg %'].round(2)
         grp['Price Move'] = grp['_price_dir'].apply(
             lambda x: '▲ Up' if x > 0 else ('▼ Down' if x < 0 else '–'))
+        grp['Candle'] = grp['_candle_dir'].apply(
+            lambda x: '▲ Up' if x > 0 else ('▼ Down' if x < 0 else '–'))
 
-        # Accuracy: days where Bias direction matches Price Move direction
-        valid = grp.dropna(subset=['_price_dir'])
-        valid = valid[valid['_price_dir'] != 0]
-        if len(valid) > 0:
-            correct = ((valid['Net_Score'] > 0) & (valid['_price_dir'] > 0)) | \
-                      ((valid['Net_Score'] < 0) & (valid['_price_dir'] < 0))
-            accuracy = correct.sum() / len(valid) * 100
+        # Accuracy: close-to-close direction vs Net Score sign
+        valid_cc = grp.dropna(subset=['_price_dir'])
+        valid_cc = valid_cc[valid_cc['_price_dir'] != 0]
+        if len(valid_cc) > 0:
+            correct_cc = ((valid_cc['Net_Score'] > 0) & (valid_cc['_price_dir'] > 0)) | \
+                         ((valid_cc['Net_Score'] < 0) & (valid_cc['_price_dir'] < 0))
+            accuracy = correct_cc.sum() / len(valid_cc) * 100
         else:
             accuracy = None
 
+        # Candle accuracy: open-to-close direction vs Net Score sign
+        valid_oc = grp.dropna(subset=['_candle_dir'])
+        valid_oc = valid_oc[valid_oc['_candle_dir'] != 0]
+        if len(valid_oc) > 0:
+            correct_oc = ((valid_oc['Net_Score'] > 0) & (valid_oc['_candle_dir'] > 0)) | \
+                         ((valid_oc['Net_Score'] < 0) & (valid_oc['_candle_dir'] < 0))
+            candle_accuracy = correct_oc.sum() / len(valid_oc) * 100
+        else:
+            candle_accuracy = None
+
         display = grp[['date', 'Aspects', 'Net_Score', 'Bias',
-                        'Price Chg %', 'Price Move']].copy()
+                        'Price Chg %', 'Price Move', 'Candle']].copy()
         display.columns = ['Date', '# Aspects', 'Net Score', 'Bias',
-                           'Price Chg %', 'Price Move']
+                           'Price Chg %', 'Price Move', 'Candle']
         display['Date'] = display['Date'].dt.date
     else:
         # Future rows — no price data available
-        accuracy = None
+        accuracy       = None
+        candle_accuracy = None
         display = grp[['date', 'Aspects', 'Net_Score', 'Bias']].copy()
         display.columns = ['Date', '# Aspects', 'Net Score', 'Bias']
         display['Date'] = display['Date'].dt.date
 
-    return display, accuracy
+    return display, accuracy, candle_accuracy
 
 
 st.markdown("---")
@@ -932,21 +954,27 @@ with tab1:
 
         # ── CHANGE 2: Daily Net Natal Score — past with price change + accuracy ──
         st.markdown(f"### Daily Net Natal Score — Past {past_days} days")
-        daily_n_past, acc_n = build_daily_net_with_price(natal_win, 'Past')
+        daily_n_past, acc_n, candle_acc_n = build_daily_net_with_price(natal_win, 'Past')
         if daily_n_past.empty:
             st.info(f"No natal aspects in the past {past_days} days.")
         else:
             st.dataframe(
                 daily_n_past.style.applymap(score_color, subset=['Net Score']),
                 use_container_width=True, hide_index=True)
+            acc_col1, acc_col2 = st.columns(2)
             if acc_n is not None:
-                st.metric(
-                    label=f"Directional Accuracy (past {past_days} days)",
+                acc_col1.metric(
+                    label=f"Close-to-Close Accuracy (past {past_days} days)",
                     value=f"{acc_n:.1f}%",
-                    help="% of days where the sign of Net Score matched the actual price move direction.")
+                    help="% of days where the sign of Net Score matched the close-to-close price move direction.")
+            if candle_acc_n is not None:
+                acc_col2.metric(
+                    label=f"Candle Accuracy (past {past_days} days)",
+                    value=f"{candle_acc_n:.1f}%",
+                    help="% of days where the sign of Net Score matched the open-to-close candle direction.")
 
         st.markdown(f"### Daily Net Natal Score — Next {table_days} days")
-        daily_n_fut, _ = build_daily_net_with_price(natal_win, 'Future')
+        daily_n_fut, _, _ = build_daily_net_with_price(natal_win, 'Future')
         if daily_n_fut.empty:
             st.info(f"No natal aspects in the next {table_days} days.")
         else:
@@ -989,21 +1017,27 @@ with tab2:
 
         # ── CHANGE 2: Daily Net Transit Score — past with price change + accuracy ──
         st.markdown(f"### Daily Net Transit Score — Past {past_days} days")
-        daily_t_past, acc_t = build_daily_net_with_price(transit_win, 'Past')
+        daily_t_past, acc_t, candle_acc_t = build_daily_net_with_price(transit_win, 'Past')
         if daily_t_past.empty:
             st.info(f"No transit aspects in the past {past_days} days.")
         else:
             st.dataframe(
                 daily_t_past.style.applymap(score_color, subset=['Net Score']),
                 use_container_width=True, hide_index=True)
+            acc_col1, acc_col2 = st.columns(2)
             if acc_t is not None:
-                st.metric(
-                    label=f"Directional Accuracy (past {past_days} days)",
+                acc_col1.metric(
+                    label=f"Close-to-Close Accuracy (past {past_days} days)",
                     value=f"{acc_t:.1f}%",
-                    help="% of days where the sign of Net Score matched the actual price move direction.")
+                    help="% of days where the sign of Net Score matched the close-to-close price move direction.")
+            if candle_acc_t is not None:
+                acc_col2.metric(
+                    label=f"Candle Accuracy (past {past_days} days)",
+                    value=f"{candle_acc_t:.1f}%",
+                    help="% of days where the sign of Net Score matched the open-to-close candle direction.")
 
         st.markdown(f"### Daily Net Transit Score — Next {table_days} days")
-        daily_t_fut, _ = build_daily_net_with_price(transit_win, 'Future')
+        daily_t_fut, _, _ = build_daily_net_with_price(transit_win, 'Future')
         if daily_t_fut.empty:
             st.info(f"No transit aspects in the next {table_days} days.")
         else:
@@ -1045,7 +1079,10 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 **Interpretation:** Score > +5 = strongly bullish · Score < −5 = strongly bearish · Score ≈ 0 = neutral
 
 **Directional Accuracy:** % of past days where the sign of the Net Score correctly predicted whether price closed up or down vs the prior trading day. Days with zero price change are excluded.
+
+**Candle Accuracy:** % of past days where the sign of the Net Score correctly predicted whether the day's candle was bullish (close > open) or bearish (close < open). Doji days (open = close) are excluded.
     """)
+
 
 
 
