@@ -125,6 +125,10 @@ with st.sidebar:
              "Set to 0 to disable separating aspects entirely.")
 
     st.markdown("### 📋 Table Horizon")
+    # ── CHANGE 1: new slider for past days in the daily net score tables ──
+    past_days = st.slider(
+        "Past days in daily net score tables", min_value=7, max_value=100, value=30, step=1,
+        help="How many past calendar days to include in the Daily Net Score tables.")
     table_days = st.slider(
         "Days ahead in tables", min_value=7, max_value=60, value=15,
         help="How many future days to include in the aspect tables.")
@@ -281,7 +285,6 @@ else:
 #  DOWNLOAD PRICE DATA
 # ============================================================
 DATA_END = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-# DATA_END = datetime.date.today().strftime("%Y-%m-%d")
 
 with st.spinner(f"Downloading {ticker} price data …"):
     try:
@@ -320,44 +323,18 @@ def orb_factor(abs_gap, orb_max):
     return np.clip(1.0 - abs_gap / orb_max, 0.0, 1.0)
 
 def aspect_score_single(pot_a, pot_b, asp, orb_f, phase, nat_a=0, nat_b=0):
-    """
-    pot_a / pot_b : planet potency (always > 0)
-    nat_a / nat_b : planet nature  (+1 benefic, -1 malefic, 0 neutral)
-    asp           : aspect angle (0, 60, 90, 120, 180)
-    orb_f         : orb proximity factor 0→1
-    phase         : 'apply' or 'sep'
-
-    Scoring rules:
-      Conjunction (asp=0):
-        - Direction = sign of (nat_a + nat_b):
-            both benefic → positive, both malefic → negative, mixed → near zero
-        - Magnitude = avg potency × |net nature| (shrinks for mixed pairs)
-
-      Other aspects:
-        - Base score from ASPECT_BASE (positive=harmonious, negative=tense)
-        - Planet nature MODULATES the base:
-            Both benefic  → harmonious aspects stronger, tense aspects weaker
-            Both malefic  → tense aspects stronger, harmonious aspects weaker
-            Mixed         → base score unchanged
-        - Magnitude = avg potency × |modulated aspect score|
-    """
     avg_pot  = (pot_a + pot_b) / 2.0
-    avg_nat  = (nat_a + nat_b) / 2.0   # range: -1 (both malefic) to +1 (both benefic)
+    avg_nat  = (nat_a + nat_b) / 2.0
 
     if asp == 0:
-        net_nature = nat_a + nat_b       # -2, -1, 0, +1, +2
+        net_nature = nat_a + nat_b
         if net_nature == 0:
-            return 0.0                   # perfect benefic/malefic cancellation
+            return 0.0
         direction = float(np.sign(net_nature))
-        # potency scales with how strongly both planets share the same nature
         magnitude = avg_pot * abs(net_nature) / 2.0
         return direction * magnitude * abs(ASPECT_BASE[0]) * orb_f * PHASE_FACTOR[phase]
     else:
         base = ASPECT_BASE[asp]
-        # Nature modulation: same-sign pairs amplify their "natural" expression.
-        # avg_nat > 0 (benefic pair)  → positive base grows, negative base shrinks
-        # avg_nat < 0 (malefic pair)  → negative base grows, positive base shrinks
-        # avg_nat = 0 (mixed)         → no change
         modulated = base * (1.0 + NATURE_MOD * avg_nat * float(np.sign(base)))
         return modulated * avg_pot * orb_f * PHASE_FACTOR[phase]
 
@@ -811,8 +788,10 @@ plt.close(fig3)
 #  ASPECT TABLES
 # ============================================================
 
-table_start = dates_px[-1] - pd.Timedelta(days=7)
-table_end   = dates_px[-1] + pd.Timedelta(days=table_days)
+# ── CHANGE 1: past window now uses user-chosen past_days slider ──
+table_past_start = dates_px[-1] - pd.Timedelta(days=past_days)
+table_start      = table_past_start
+table_end        = dates_px[-1] + pd.Timedelta(days=table_days)
 
 def filter_window(detail_list):
     rows = []
@@ -839,10 +818,77 @@ def score_color(val):
         if val < 0:  return 'color: #E84040'
     return ''
 
+# ── CHANGE 2: helper to build daily-net table with price change + accuracy ──
+def build_daily_net_with_price(raw_win, period_filter):
+    """
+    Aggregates raw aspect detail rows into a daily net score table,
+    joins actual price change for past rows, and returns:
+      - display DataFrame
+      - accuracy float (only meaningful for 'Past')
+    """
+    if raw_win.empty:
+        return pd.DataFrame(), None
+
+    grp = (raw_win.groupby(['date', 'period'])
+           .agg(Aspects=('score', 'count'), Net_Score=('score', 'sum'))
+           .reset_index()
+           .sort_values('date'))
+
+    grp = grp[grp['period'] == period_filter].copy()
+    if grp.empty:
+        return pd.DataFrame(), None
+
+    grp['Bias'] = grp['Net_Score'].apply(
+        lambda x: '▲ Bullish' if x > 0 else '▼ Bearish')
+    grp['date'] = pd.to_datetime(grp['date'])
+
+    if period_filter == 'Past':
+        # Build a daily close series indexed by date (date only, no time)
+        close_series = price_df['Close'].copy()
+        close_series.index = pd.to_datetime(close_series.index).normalize()
+        # Price change vs previous trading day close
+        price_chg = close_series.pct_change() * 100   # % change
+        price_dir = close_series.diff()                # raw direction
+
+        grp = grp.merge(
+            pd.DataFrame({'date': close_series.index,
+                          'Price Chg %': price_chg.values,
+                          '_price_dir': price_dir.values}),
+            on='date', how='left')
+
+        grp['Price Chg %'] = grp['Price Chg %'].round(2)
+        grp['Price Move'] = grp['_price_dir'].apply(
+            lambda x: '▲ Up' if x > 0 else ('▼ Down' if x < 0 else '–'))
+
+        # Accuracy: days where Bias direction matches Price Move direction
+        valid = grp.dropna(subset=['_price_dir'])
+        valid = valid[valid['_price_dir'] != 0]
+        if len(valid) > 0:
+            correct = ((valid['Net_Score'] > 0) & (valid['_price_dir'] > 0)) | \
+                      ((valid['Net_Score'] < 0) & (valid['_price_dir'] < 0))
+            accuracy = correct.sum() / len(valid) * 100
+        else:
+            accuracy = None
+
+        display = grp[['date', 'Aspects', 'Net_Score', 'Bias',
+                        'Price Chg %', 'Price Move']].copy()
+        display.columns = ['Date', '# Aspects', 'Net Score', 'Bias',
+                           'Price Chg %', 'Price Move']
+        display['Date'] = display['Date'].dt.date
+    else:
+        # Future rows — no price data available
+        accuracy = None
+        display = grp[['date', 'Aspects', 'Net_Score', 'Bias']].copy()
+        display.columns = ['Date', '# Aspects', 'Net Score', 'Bias']
+        display['Date'] = display['Date'].dt.date
+
+    return display, accuracy
+
+
 st.markdown("---")
 st.markdown("## 📋 Aspect Tables")
 st.caption(
-    f"Last 7 calendar days + next {table_days} days. "
+    f"Past {past_days} calendar days + next {table_days} days. "
     "Green score = bullish, Red = bearish.")
 
 tab1, tab2 = st.tabs(["🌟 Natal Aspects", "🔄 Transit × Transit Aspects"])
@@ -864,10 +910,10 @@ with tab1:
         display_n['Transit']      = display_n['Transit'].str.capitalize()
         display_n['Natal Planet'] = display_n['Natal Planet'].str.capitalize()
 
-        st.markdown("### Past 7 days")
+        st.markdown(f"### Past {past_days} days")
         past_n = display_n[display_n['Period']=='Past']
         if past_n.empty:
-            st.info("No natal aspects in the past 7 days.")
+            st.info(f"No natal aspects in the past {past_days} days.")
         else:
             st.dataframe(
                 past_n.drop(columns='Period').style.applymap(
@@ -877,25 +923,36 @@ with tab1:
         st.markdown(f"### Next {table_days} days")
         fut_n = display_n[display_n['Period']=='Future']
         if fut_n.empty:
-            st.info("No natal aspects in the next {table_days} days.")
+            st.info(f"No natal aspects in the next {table_days} days.")
         else:
             st.dataframe(
                 fut_n.drop(columns='Period').style.applymap(
                     score_color, subset=['Score']),
                 use_container_width=True, hide_index=True)
 
-        # Daily net summary
-        st.markdown("### Daily Net Natal Score")
-        daily_n = (natal_win.groupby(['date','period'])
-                   .agg(Aspects=('score','count'), Net_Score=('score','sum'))
-                   .reset_index().sort_values('date'))
-        daily_n['Bias'] = daily_n['Net_Score'].apply(
-            lambda x: '▲ Bullish' if x > 0 else '▼ Bearish')
-        daily_n['date'] = daily_n['date'].astype(str)
-        daily_n.columns = ['Date','Period','# Aspects','Net Score','Bias']
-        st.dataframe(
-            daily_n.style.applymap(score_color, subset=['Net Score']),
-            use_container_width=True, hide_index=True)
+        # ── CHANGE 2: Daily Net Natal Score — past with price change + accuracy ──
+        st.markdown(f"### Daily Net Natal Score — Past {past_days} days")
+        daily_n_past, acc_n = build_daily_net_with_price(natal_win, 'Past')
+        if daily_n_past.empty:
+            st.info(f"No natal aspects in the past {past_days} days.")
+        else:
+            st.dataframe(
+                daily_n_past.style.applymap(score_color, subset=['Net Score']),
+                use_container_width=True, hide_index=True)
+            if acc_n is not None:
+                st.metric(
+                    label=f"Directional Accuracy (past {past_days} days)",
+                    value=f"{acc_n:.1f}%",
+                    help="% of days where the sign of Net Score matched the actual price move direction.")
+
+        st.markdown(f"### Daily Net Natal Score — Next {table_days} days")
+        daily_n_fut, _ = build_daily_net_with_price(natal_win, 'Future')
+        if daily_n_fut.empty:
+            st.info(f"No natal aspects in the next {table_days} days.")
+        else:
+            st.dataframe(
+                daily_n_fut.style.applymap(score_color, subset=['Net Score']),
+                use_container_width=True, hide_index=True)
 
 with tab2:
     if transit_win.empty:
@@ -910,10 +967,10 @@ with tab2:
         display_t['Planet A'] = display_t['Planet A'].str.capitalize()
         display_t['Planet B'] = display_t['Planet B'].str.capitalize()
 
-        st.markdown("### Past 7 days")
+        st.markdown(f"### Past {past_days} days")
         past_t = display_t[display_t['Period']=='Past']
         if past_t.empty:
-            st.info("No transit aspects in the past 7 days.")
+            st.info(f"No transit aspects in the past {past_days} days.")
         else:
             st.dataframe(
                 past_t.drop(columns='Period').style.applymap(
@@ -930,17 +987,29 @@ with tab2:
                     score_color, subset=['Score']),
                 use_container_width=True, hide_index=True)
 
-        st.markdown("### Daily Net Transit Score")
-        daily_t = (transit_win.groupby(['date','period'])
-                   .agg(Aspects=('score','count'), Net_Score=('score','sum'))
-                   .reset_index().sort_values('date'))
-        daily_t['Bias'] = daily_t['Net_Score'].apply(
-            lambda x: '▲ Bullish' if x > 0 else '▼ Bearish')
-        daily_t['date'] = daily_t['date'].astype(str)
-        daily_t.columns = ['Date','Period','# Aspects','Net Score','Bias']
-        st.dataframe(
-            daily_t.style.applymap(score_color, subset=['Net Score']),
-            use_container_width=True, hide_index=True)
+        # ── CHANGE 2: Daily Net Transit Score — past with price change + accuracy ──
+        st.markdown(f"### Daily Net Transit Score — Past {past_days} days")
+        daily_t_past, acc_t = build_daily_net_with_price(transit_win, 'Past')
+        if daily_t_past.empty:
+            st.info(f"No transit aspects in the past {past_days} days.")
+        else:
+            st.dataframe(
+                daily_t_past.style.applymap(score_color, subset=['Net Score']),
+                use_container_width=True, hide_index=True)
+            if acc_t is not None:
+                st.metric(
+                    label=f"Directional Accuracy (past {past_days} days)",
+                    value=f"{acc_t:.1f}%",
+                    help="% of days where the sign of Net Score matched the actual price move direction.")
+
+        st.markdown(f"### Daily Net Transit Score — Next {table_days} days")
+        daily_t_fut, _ = build_daily_net_with_price(transit_win, 'Future')
+        if daily_t_fut.empty:
+            st.info(f"No transit aspects in the next {table_days} days.")
+        else:
+            st.dataframe(
+                daily_t_fut.style.applymap(score_color, subset=['Net Score']),
+                use_container_width=True, hide_index=True)
 
 # ============================================================
 #  SCORING LEGEND
@@ -974,10 +1043,9 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 **Aspect Multipliers:** Trine +2.0 · Sextile +1.5 · Conj ±1.0 · Opposition −1.5 · Square −1.8
 
 **Interpretation:** Score > +5 = strongly bullish · Score < −5 = strongly bearish · Score ≈ 0 = neutral
+
+**Directional Accuracy:** % of past days where the sign of the Net Score correctly predicted whether price closed up or down vs the prior trading day. Days with zero price change are excluded.
     """)
-
-
-
 
 
 
@@ -1077,19 +1145,19 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 
 #     st.markdown("### 📈 Asset")
 #     ticker = st.text_input(
-#         "Ticker (yfinance)", value="GLD",
+#         "Ticker (yfinance)", value="EREGL.IS",
 #         help="Any yfinance ticker: GLD, AAPL, XU100.IS, BTC-USD …")
 
 #     st.markdown("### 🌟 Natal Chart")
 #     natal_date_input = st.text_input(
 #         "Natal / birth date (YYYY-MM-DD)",
-#         value="1933-01-30",
+#         value="1986-01-13",
 #         help="Founding or listing date of the asset. Leave blank to skip natal aspects.")
 
 #     st.markdown("### 📅 Date Range")
 #     data_start = st.text_input(
 #         "Price data start (YYYY-MM-DD)",
-#         value="2023-01-01",
+#         value="2022-01-01",
 #         help="Start date for downloading OHLC price data.")
 
 #     chart_end_input = st.text_input(
@@ -1100,11 +1168,11 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 #     st.markdown("### 🔭 Orb Settings")
 #     orb_apply = st.slider(
 #         "Applying orb (degrees)",
-#         min_value=0.5, max_value=6.0, value=4.0, step=0.5,
+#         min_value=0.5, max_value=6.0, value=4.0, step=0.25,
 #         help="How many degrees before exact to start counting an aspect.")
 #     orb_sep = st.slider(
 #         "Separating orb (degrees)",
-#         min_value=0.0, max_value=3.0, value=1.0, step=0.5,
+#         min_value=0.0, max_value=3.0, value=1.0, step=0.25,
 #         help="How many degrees after exact to keep counting an aspect. "
 #              "Set to 0 to disable separating aspects entirely.")
 
@@ -1146,30 +1214,60 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 # SIGNS     = ['Aries','Taurus','Gemini','Cancer','Leo','Virgo',
 #              'Libra','Scorpio','Sagittarius','Capricorn','Aquarius','Pisces']
 
-# PLANET_WEIGHT = {
-#     'sun':       +1.5,
-#     'moon':      +1.0,
-#     'mercury':   +0.5,
-#     'venus':     +2.0,
-#     'mars':      -1.5,
-#     'jupiter':   +3.0,
-#     'saturn':    -2.5,
-#     'uranus':    -0.5,
-#     'neptune':   +0.5,
-#     'pluto':     -1.0,
-#     'true_node': +0.5,
-#     'mean_node': +0.5,
+# # Planet POTENCY: always positive — how strongly the planet expresses any aspect.
+# # Benefics express harmonious aspects more strongly.
+# # Malefics express tense aspects more strongly.
+# PLANET_POTENCY = {
+#     'jupiter':   3.0,
+#     'venus':     2.0,
+#     'sun':       1.5,
+#     'moon':      1.0,
+#     'mars':      2.0,   # high potency — strong malefic
+#     'saturn':    2.5,   # high potency — strong malefic
+#     'pluto':     1.5,
+#     'mercury':   0.5,
+#     'neptune':   0.5,
+#     'uranus':    0.5,
+#     'true_node': 0.5,
+#     'mean_node': 0.5,
 # }
 
-# ASPECT_MULT = {
-#     0:   +1.0,
-#     60:  +1.5,
-#     90:  -1.8,
-#     120: +2.0,
-#     180: -1.5,
+# # Planet NATURE: +1 = benefic, -1 = malefic, 0 = neutral
+# # This modulates how much a planet amplifies harmonious vs tense aspects.
+# PLANET_NATURE = {
+#     'jupiter':   +1,
+#     'venus':     +1,
+#     'sun':       +1,
+#     'moon':      +1,
+#     'neptune':   +1,
+#     'true_node': +1,
+#     'mean_node': +1,
+#     'mercury':    0,   # neutral — context-dependent
+#     'mars':      -1,
+#     'saturn':    -1,
+#     'uranus':    -1,
+#     'pluto':     -1,
 # }
+
+# # Base aspect polarity: positive = harmonious, negative = tense
+# ASPECT_BASE = {
+#     0:    0.0,   # conjunction: neutral base — planet nature determines sign
+#     60:  +1.5,   # sextile:     harmonious
+#     90:  -1.8,   # square:      tense
+#     120: +2.0,   # trine:       harmonious
+#     180: -1.5,   # opposition:  tense
+# }
+
+# # Planet nature modulation factor:
+# # When both planets are same-nature, this amplifies the "natural" expression.
+# # When mixed, it averages toward face value.
+# # Value of 0.35 means same-sign pair shifts score by ±35%.
+# NATURE_MOD = 0.35
 
 # PHASE_FACTOR = {'apply': 1.0, 'sep': 0.6}
+
+# # Keep ASPECT_MULT as alias for chart title display
+# ASPECT_MULT = ASPECT_BASE
 
 # # Colours (match existing chart palette)
 # BG     = '#0A0A1A';  PANEL  = '#0D0D28';  GOLD   = '#C8A84B'
@@ -1234,8 +1332,8 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 # # ============================================================
 # #  DOWNLOAD PRICE DATA
 # # ============================================================
-
-# DATA_END = datetime.date.today().strftime("%Y-%m-%d")
+# DATA_END = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+# # DATA_END = datetime.date.today().strftime("%Y-%m-%d")
 
 # with st.spinner(f"Downloading {ticker} price data …"):
 #     try:
@@ -1273,24 +1371,47 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 #         return 1.0 if abs_gap == 0 else 0.0
 #     return np.clip(1.0 - abs_gap / orb_max, 0.0, 1.0)
 
-# def aspect_score_single(pw_a, pw_b, asp, orb_f, phase):
+# def aspect_score_single(pot_a, pot_b, asp, orb_f, phase, nat_a=0, nat_b=0):
+#     """
+#     pot_a / pot_b : planet potency (always > 0)
+#     nat_a / nat_b : planet nature  (+1 benefic, -1 malefic, 0 neutral)
+#     asp           : aspect angle (0, 60, 90, 120, 180)
+#     orb_f         : orb proximity factor 0→1
+#     phase         : 'apply' or 'sep'
+
+#     Scoring rules:
+#       Conjunction (asp=0):
+#         - Direction = sign of (nat_a + nat_b):
+#             both benefic → positive, both malefic → negative, mixed → near zero
+#         - Magnitude = avg potency × |net nature| (shrinks for mixed pairs)
+
+#       Other aspects:
+#         - Base score from ASPECT_BASE (positive=harmonious, negative=tense)
+#         - Planet nature MODULATES the base:
+#             Both benefic  → harmonious aspects stronger, tense aspects weaker
+#             Both malefic  → tense aspects stronger, harmonious aspects weaker
+#             Mixed         → base score unchanged
+#         - Magnitude = avg potency × |modulated aspect score|
+#     """
+#     avg_pot  = (pot_a + pot_b) / 2.0
+#     avg_nat  = (nat_a + nat_b) / 2.0   # range: -1 (both malefic) to +1 (both benefic)
+
 #     if asp == 0:
-#         # Conjunction: direction AND magnitude both come from net polarity sum.
-#         #   Same-sign  (both benefic / both malefic) : |net| > either alone → amplifies
-#         #   Mixed-sign (one benefic + one malefic)   : |net| < either alone → dampens
-#         #   Perfect cancellation                      : returns 0
-#         net_polarity = pw_a + pw_b
-#         if net_polarity == 0:
-#             return 0.0
-#         direction    = float(np.sign(net_polarity))
-#         magnitude    = abs(net_polarity)          # shrinks when signs oppose
-#         asp_strength = abs(ASPECT_MULT[0])
+#         net_nature = nat_a + nat_b       # -2, -1, 0, +1, +2
+#         if net_nature == 0:
+#             return 0.0                   # perfect benefic/malefic cancellation
+#         direction = float(np.sign(net_nature))
+#         # potency scales with how strongly both planets share the same nature
+#         magnitude = avg_pot * abs(net_nature) / 2.0
+#         return direction * magnitude * abs(ASPECT_BASE[0]) * orb_f * PHASE_FACTOR[phase]
 #     else:
-#         # Non-conjunction: aspect type sets direction; planet weights set magnitude
-#         direction    = float(np.sign(ASPECT_MULT[asp]))
-#         magnitude    = (abs(pw_a) + abs(pw_b)) / 2.0
-#         asp_strength = abs(ASPECT_MULT[asp])
-#     return direction * magnitude * asp_strength * orb_f * PHASE_FACTOR[phase]
+#         base = ASPECT_BASE[asp]
+#         # Nature modulation: same-sign pairs amplify their "natural" expression.
+#         # avg_nat > 0 (benefic pair)  → positive base grows, negative base shrinks
+#         # avg_nat < 0 (malefic pair)  → negative base grows, positive base shrinks
+#         # avg_nat = 0 (mixed)         → no change
+#         modulated = base * (1.0 + NATURE_MOD * avg_nat * float(np.sign(base)))
+#         return modulated * avg_pot * orb_f * PHASE_FACTOR[phase]
 
 # def compute_natal_score(date_index):
 #     eph_a  = eph.reindex(date_index, method='ffill')
@@ -1301,10 +1422,12 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 #         if tp not in eph_a.columns: continue
 #         t_lons  = eph_a[tp].values.astype(float) % 360
 #         motion  = np.gradient(np.unwrap(t_lons, period=360))
-#         pw_t    = PLANET_WEIGHT.get(tp, 0.0)
+#         pot_t   = PLANET_POTENCY.get(tp, 0.5)
+#         nat_t   = PLANET_NATURE.get(tp, 0)
 #         for np_ in avail_planets:
-#             n_lon = natal[np_]
-#             pw_n  = PLANET_WEIGHT.get(np_, 0.0)
+#             n_lon   = natal[np_]
+#             pot_n   = PLANET_POTENCY.get(np_, 0.5)
+#             nat_n   = PLANET_NATURE.get(np_, 0)
 #             for asp in ASPECTS:
 #                 target  = (n_lon + asp) % 360
 #                 gap     = angular_diff(t_lons, target)
@@ -1314,7 +1437,7 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 #                 mask_s = (~applying) & (abs_gap <= orb_sep)
 #                 for i in np.where(mask_a)[0]:
 #                     of = float(orb_factor(abs_gap[i], orb_apply))
-#                     sc = aspect_score_single(pw_t, pw_n, asp, of, 'apply')
+#                     sc = aspect_score_single(pot_t, pot_n, asp, of, 'apply', nat_t, nat_n)
 #                     scores[i] += sc
 #                     detail.append({'date': date_index[i], 'transit': tp,
 #                                    'natal': np_, 'aspect': ASP_NAMES[asp],
@@ -1323,7 +1446,7 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 #                                    'score': round(sc, 4)})
 #                 for i in np.where(mask_s)[0]:
 #                     of = float(orb_factor(abs_gap[i], orb_sep))
-#                     sc = aspect_score_single(pw_t, pw_n, asp, of, 'sep')
+#                     sc = aspect_score_single(pot_t, pot_n, asp, of, 'sep', nat_t, nat_n)
 #                     scores[i] += sc
 #                     detail.append({'date': date_index[i], 'transit': tp,
 #                                    'natal': np_, 'aspect': ASP_NAMES[asp],
@@ -1343,8 +1466,10 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 #         lon_A   = eph_a[pA].values.astype(float) % 360
 #         lon_B   = eph_a[pB].values.astype(float) % 360
 #         motion  = np.gradient(np.unwrap(lon_A, period=360))
-#         pw_A    = PLANET_WEIGHT.get(pA, 0.0)
-#         pw_B    = PLANET_WEIGHT.get(pB, 0.0)
+#         pot_A   = PLANET_POTENCY.get(pA, 0.5)
+#         pot_B   = PLANET_POTENCY.get(pB, 0.5)
+#         nat_A   = PLANET_NATURE.get(pA, 0)
+#         nat_B   = PLANET_NATURE.get(pB, 0)
 #         for asp in ASPECTS:
 #             target  = (lon_B + asp) % 360
 #             gap     = angular_diff(lon_A, target)
@@ -1354,7 +1479,7 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 #             mask_s = (~applying) & (abs_gap <= orb_sep)
 #             for i in np.where(mask_a)[0]:
 #                 of = float(orb_factor(abs_gap[i], orb_apply))
-#                 sc = aspect_score_single(pw_A, pw_B, asp, of, 'apply')
+#                 sc = aspect_score_single(pot_A, pot_B, asp, of, 'apply', nat_A, nat_B)
 #                 scores[i] += sc
 #                 detail.append({'date': date_index[i], 'planet_a': pA,
 #                                'planet_b': pB, 'aspect': ASP_NAMES[asp],
@@ -1363,7 +1488,7 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 #                                'score': round(sc, 4)})
 #             for i in np.where(mask_s)[0]:
 #                 of = float(orb_factor(abs_gap[i], orb_sep))
-#                 sc = aspect_score_single(pw_A, pw_B, asp, of, 'sep')
+#                 sc = aspect_score_single(pot_A, pot_B, asp, of, 'sep', nat_A, nat_B)
 #                 scores[i] += sc
 #                 detail.append({'date': date_index[i], 'planet_a': pA,
 #                                'planet_b': pB, 'aspect': ASP_NAMES[asp],
@@ -1902,6 +2027,8 @@ with st.expander("📖 Scoring Methodology", expanded=False):
 
 # **Interpretation:** Score > +5 = strongly bullish · Score < −5 = strongly bearish · Score ≈ 0 = neutral
 #     """)
+
+
 
 
 
