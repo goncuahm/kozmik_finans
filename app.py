@@ -116,11 +116,11 @@ with st.sidebar:
     st.markdown("### 🔭 Orb Settings")
     orb_apply = st.slider(
         "Applying orb (degrees)",
-        min_value=0.5, max_value=6.0, value=4.0, step=0.25,
+        min_value=0.5, max_value=6.0, value=4.50, step=0.25,
         help="How many degrees before exact to start counting an aspect.")
     orb_sep = st.slider(
         "Separating orb (degrees)",
-        min_value=0.0, max_value=3.0, value=1.0, step=0.25,
+        min_value=0.0, max_value=3.0, value=0.50, step=0.25,
         help="How many degrees after exact to keep counting an aspect. "
              "Set to 0 to disable separating aspects entirely.")
 
